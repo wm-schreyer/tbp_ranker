@@ -15,20 +15,28 @@ StratifiedGroupKFold(5) split grouped by patient (no patient leakage), one LGBMR
 fold. Every row is predicted out-of-fold once per seed, so the OOF scores are used to
 evaluate single models and the seed-averaged ensemble (three ways of averaging).
 
+Each ranker also gets a Platt calibrator (1-feature logistic regression on its held-out
+fold's scores vs. the binary malignant target), putting every model on a common scale
+before averaging.
+
 Usage
 -----
     python train_lgbm_ranker.py                                  # label_gain 0,1,3,7
     python train_lgbm_ranker.py --label-gain 0,1,10,100 --model_prefix gain100_
     python train_lgbm_ranker.py --query-by chunk --chunk-size 5000 --neg-frac 0.2
+    python train_lgbm_ranker.py --objective rank_xendcg
+    python train_lgbm_ranker.py --neg-per-group 50 --truncation-level 30 --eval-at 15
 """
 import argparse
 import json
+import warnings
 from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
+from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedGroupKFold
 from tqdm import tqdm
 
@@ -37,6 +45,9 @@ from retrain_predict import (
     ID_COL, TARGET_COL, GROUP_COL, SEED,
     COLUMNS_TO_DROP, IMAGE_FEATURE_COLS, LGB_PARAMS, ARTIFACT_DIR, TOP_FEATURES_PATH,
 )
+
+# LightGBM >= 4.7 deprecates eval_set in favour of eval_X/eval_y; older versions only accept eval_set.
+warnings.filterwarnings("ignore", message=".*'eval_set' is deprecated.*")
 
 N_FOLDS = 5
 DEFAULT_LABEL_GAIN = "0,1,3,7"
@@ -76,17 +87,36 @@ def group_sizes(sorted_qids):
     return np.unique(sorted_qids, return_counts=True)[1]
 
 
+def subsample_train(tr_idx, label, qids, rng, args):
+    """Keep every label > 0 row and thin the label-0 rows: at most --neg-per-group random
+    zeros per query if set, otherwise a random --neg-frac fraction of them."""
+    zero = label[tr_idx] == 0
+    if args.neg_per_group > 0:
+        order = pd.Series(rng.random(zero.sum())).groupby(qids[tr_idx][zero]).rank(method="first").values
+        keep = np.ones(len(tr_idx), dtype=bool)
+        keep[np.flatnonzero(zero)[order > args.neg_per_group]] = False
+    else:
+        keep = ~zero | (rng.random(len(tr_idx)) < args.neg_frac)
+    return tr_idx[keep]
+
+
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
-def train_rankers(df, use_cols, label, args):
-    """45 (n_seeds x 5) LGBMRankers. Returns the models and an (n_seeds, N) OOF score matrix."""
+def train_rankers(df, use_cols, label, target, args):
+    """n_seeds x 5 LGBMRankers, each with a Platt calibrator fit on its held-out fold.
+    Returns models, calibrators, per-model final validation NDCG@k, and (n_seeds, N) OOF
+    raw scores and calibrated logits."""
     params = {k: v for k, v in LGB_PARAMS.items() if k != "scale_pos_weight"}  # n/a to lambdarank
-    params.update(objective="lambdarank", metric="ndcg", label_gain=args.label_gain)
+    params.update(objective=args.objective, metric="ndcg", label_gain=args.label_gain)
+    if args.objective == "lambdarank":  # truncation applies to lambdarank only
+        params["lambdarank_truncation_level"] = args.truncation_level
+    ndcg_key = f"ndcg@{args.eval_at}"
 
     n = len(df)
     oof = np.full((args.n_seeds, n), np.nan)
-    models = []
+    oof_logit = np.full((args.n_seeds, n), np.nan)
+    models, calibrators, val_ndcg = [], [], []
 
     with tqdm(total=args.n_seeds * N_FOLDS, desc="  lgbm-ranker") as pbar:
         for s in range(args.n_seeds):
@@ -95,49 +125,77 @@ def train_rankers(df, use_cols, label, args):
             qids = make_query_ids(df, args.query_by, args.chunk_size, seed)
             skf = StratifiedGroupKFold(N_FOLDS, shuffle=True, random_state=seed)
             for tr_idx, va_idx in skf.split(df, y=label, groups=df[GROUP_COL]):
-                # Keep every lesion with label > 0; subsample the plain-benign rows.
-                keep = (label[tr_idx] > 0) | (rng.random(len(tr_idx)) < args.neg_frac)
-                tr_idx = tr_idx[keep]
+                tr_idx = subsample_train(tr_idx, label, qids, rng, args)
                 tr_idx = tr_idx[np.argsort(qids[tr_idx], kind="stable")]  # groups must be contiguous
+                va_idx = va_idx[np.argsort(qids[va_idx], kind="stable")]  # validation uses FULL groups
 
                 tr_x = df.iloc[tr_idx][use_cols].reset_index(drop=True)
                 for col in IMAGE_FEATURE_COLS:  # same light jitter as the original stack
                     tr_x[col] = tr_x[col] + np.random.normal(0, 0.1, size=tr_x.shape[0])
+                va_x = df.iloc[va_idx][use_cols]
 
                 ranker = lgb.LGBMRanker(**{**params, "random_state": seed})
-                ranker.fit(tr_x, label[tr_idx], group=group_sizes(qids[tr_idx]))
-                oof[s, va_idx] = ranker.predict(df.iloc[va_idx][use_cols])
+                ranker.fit(tr_x, label[tr_idx], group=group_sizes(qids[tr_idx]),
+                           eval_set=[(va_x, label[va_idx])], eval_group=[group_sizes(qids[va_idx])],
+                           eval_at=[args.eval_at])  # eval_at only sets the reported NDCG@k
+                val_ndcg.append(ranker.evals_result_["valid_0"][ndcg_key][-1])
+
+                score = ranker.predict(va_x)
+                cal = LogisticRegression(C=1e6).fit(score.reshape(-1, 1), target[va_idx])
+                oof[s, va_idx] = score
+                oof_logit[s, va_idx] = cal.decision_function(score.reshape(-1, 1))
                 models.append(ranker)
+                calibrators.append(cal)
                 pbar.update(1)
-    return models, oof
+    return models, calibrators, np.array(val_ndcg), oof, oof_logit
 
 
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
-def aggregate_scores(oof, method):
-    """Combine per-seed OOF score vectors: raw mean, z-scored mean, or mean percentile rank."""
+METHODS = ("mean", "zscore", "rank", "platt_logit", "platt_prob")
+
+
+def aggregate_scores(oof, oof_logit, method):
+    """Combine per-seed OOF score vectors: raw mean, z-scored mean, mean percentile rank,
+    or the mean of Platt-calibrated logits / probabilities."""
     if method == "mean":
         return oof.mean(axis=0)
     if method == "zscore":
         return ((oof - oof.mean(axis=1, keepdims=True)) / oof.std(axis=1, keepdims=True)).mean(axis=0)
     if method == "rank":
         return np.mean([pd.Series(row).rank(pct=True).values for row in oof], axis=0)
+    if method == "platt_logit":
+        return oof_logit.mean(axis=0)
+    if method == "platt_prob":
+        return (1.0 / (1.0 + np.exp(-oof_logit))).mean(axis=0)
     raise ValueError(method)
 
 
-def evaluate(oof, target, label):
-    """Competition pAUC (any malignant) and melanoma-only pAUC, for single models and ensembles."""
+def topk_recall(scores, patients, label, k):
+    """Share of malignant (label >= 2) and melanoma (label 3) lesions that land in their
+    patient's top-k by score, ranking within each patient's FULL set of lesions."""
+    rank_in_patient = pd.Series(scores).groupby(patients).rank(ascending=False, method="first").values
+    in_top = rank_in_patient <= k
+    return in_top[label >= 2].mean(), in_top[label == 3].mean()
+
+
+def evaluate(oof, oof_logit, patients, target, label, k):
+    """Competition pAUC (any malignant), melanoma-only pAUC and per-patient top-k recall,
+    for single models and for each ensemble averaging method."""
     mel = (label == 3).astype(int)
-    single = np.array([[custom_metric_raw(row, target), custom_metric_raw(row, mel)] for row in oof])
-    print(f"\n  single model (per-seed OOF, n={len(oof)}):  "
-          f"pAUC malignant {single[:, 0].mean():.5f} +/- {single[:, 0].std():.5f} | "
-          f"pAUC melanoma {single[:, 1].mean():.5f} +/- {single[:, 1].std():.5f}")
-    for method in ("mean", "zscore", "rank"):
-        agg = aggregate_scores(oof, method)
-        print(f"  ensemble [{method:>6}]:               "
-              f"pAUC malignant {custom_metric_raw(agg, target):.5f} | "
-              f"pAUC melanoma {custom_metric_raw(agg, mel):.5f}")
+
+    def row(scores):
+        rec = topk_recall(scores, patients, label, k)
+        return [custom_metric_raw(scores, target), custom_metric_raw(scores, mel), *rec]
+
+    single = np.array([row(r) for r in oof])
+    m, sd = single.mean(axis=0), single.std(axis=0)
+    print(f"\n  {'':22s}{'pAUC malig':>12s}{'pAUC mel':>12s}{f'top{k} malig':>13s}{f'top{k} mel':>12s}")
+    print(f"  {'single model (avg)':22s}" + "".join(f"{v:>12.4f}" for v in m[:2]) + "".join(f"{v:>13.4f}" if i == 0 else f"{v:>12.4f}" for i, v in enumerate(m[2:])))
+    for method in METHODS:
+        r = row(aggregate_scores(oof, oof_logit, method))
+        print(f"  {'ensemble ' + method:22s}" + "".join(f"{v:>12.4f}" for v in r[:2]) + "".join(f"{v:>13.4f}" if i == 0 else f"{v:>12.4f}" for i, v in enumerate(r[2:])))
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +210,16 @@ def main():
     ap.add_argument("--chunk-size", type=int, default=5000, help="Approx. lesions per query for --query-by chunk.")
     ap.add_argument("--neg-frac", type=float, default=0.1,
                     help="Fraction of label-0 training rows kept (labels 1-3 are always kept).")
+    ap.add_argument("--neg-per-group", type=int, default=0,
+                    help="If > 0, keep at most this many label-0 rows per query (overrides --neg-frac).")
+    ap.add_argument("--objective", choices=["lambdarank", "rank_xendcg"], default="lambdarank",
+                    help="rank_xendcg is cheaper and has no truncation level; as I recall LightGBM then "
+                         "ignores --label-gain for training (it still uses it for the NDCG metric).")
+    ap.add_argument("--truncation-level", type=int, default=30,
+                    help="lambdarank_truncation_level: pairs are formed only if one item is in the model's "
+                         "current top-N for its query. This is what focuses training on the top of each group.")
+    ap.add_argument("--eval-at", type=int, default=15,
+                    help="k for the reported validation NDCG@k and the per-patient top-k recall.")
     ap.add_argument("--n-seeds", type=int, default=9, help="CV repeats (x5 folds = models).")
     ap.add_argument("--artifact-dir", default=Path(ARTIFACT_DIR) / "ranker", help="Where models/OOF scores are saved.")
     ap.add_argument("--model_prefix", type=str, default="", help="Name prepended to saved files.")
@@ -174,21 +242,24 @@ def main():
     print("  [labels] counts:", dict(zip(*np.unique(label, return_counts=True))))
     target = df[TARGET_COL].astype(int).values
 
-    models, oof = train_rankers(df, use_cols, label, args)
-    evaluate(oof, target, label)
+    models, calibrators, val_ndcg, oof, oof_logit = train_rankers(df, use_cols, label, target, args)
+    print(f"\n  validation NDCG@{args.eval_at} per model (full groups): {val_ndcg.mean():.4f} +/- {val_ndcg.std():.4f}")
+    evaluate(oof, oof_logit, df[GROUP_COL].values, target, label, args.eval_at)
 
     out_dir = Path(args.artifact_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     pre = args.model_prefix
     joblib.dump(models, out_dir / f"{pre}ranker_models.joblib")
+    joblib.dump(calibrators, out_dir / f"{pre}ranker_calibrators.joblib")
     joblib.dump({"feature_cols": feature_cols, "use_cols": use_cols, "cat_cols": onehot_cols,
                  "columns_to_drop": COLUMNS_TO_DROP, "scaling": scaling, "encoder": encoder,
                  "label_gain": args.label_gain}, out_dir / f"{pre}ranker_meta.joblib")
     oof_df = df[[ID_COL, GROUP_COL, TARGET_COL]].assign(label=label)
     for s in range(len(oof)):
         oof_df[f"oof_seed{s + 1}"] = oof[s]
+        oof_df[f"oof_logit_seed{s + 1}"] = oof_logit[s]
     oof_df.to_parquet(out_dir / f"{pre}ranker_oof.parquet", index=False)
-    print(f"Saved {len(models)} rankers, metadata and OOF scores to {out_dir}")
+    print(f"Saved {len(models)} rankers, calibrators, metadata and OOF scores to {out_dir}")
 
 
 if __name__ == "__main__":
