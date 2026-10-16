@@ -680,7 +680,7 @@ def _build_training_frame(lof_by_site, features_dict):
 
     # EVA + EdgeNeXt OOF image scores (train side uses the ranked OOF columns), and
     # the fold-0 mean/std used to scale the corresponding test-time NN outputs.
-    eva = pd.read_parquet()
+    eva = pd.read_parquet(OOF_EVA_PATH)
     eva_agg = eva.groupby("fold_n").agg(
         mean_preds=pd.NamedAgg("tmp_predictions_all", "mean"),
         std_preds=pd.NamedAgg("tmp_predictions_all", "std"),
