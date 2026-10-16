@@ -24,6 +24,7 @@ Usage
     python train_lgbm_ranker.py                                  # label_gain 0,1,3,7
     python train_lgbm_ranker.py --label-gain 0,1,10,100 --model_prefix gain100_
     python train_lgbm_ranker.py --query-by chunk --chunk-size 5000 --neg-frac 0.2
+    python train_lgbm_ranker.py --min-group-label 2 --n-seeds 5
     python train_lgbm_ranker.py --objective rank_xendcg
     python train_lgbm_ranker.py --neg-per-group 50 --truncation-level 30 --eval-at 15
 """
@@ -87,6 +88,15 @@ def group_sizes(sorted_qids):
     return np.unique(sorted_qids, return_counts=True)[1]
 
 
+def drop_low_label_groups(tr_idx, label, qids, min_label):
+    """Drop training queries whose highest label is below min_label (0 = keep everything).
+    Validation/OOF rows are never dropped."""
+    if min_label <= 0:
+        return tr_idx
+    qmax = pd.Series(label[tr_idx]).groupby(qids[tr_idx]).transform("max").values
+    return tr_idx[qmax >= min_label]
+
+
 def subsample_train(tr_idx, label, qids, rng, args):
     """Keep every label > 0 row and thin the label-0 rows: at most --neg-per-group random
     zeros per query if set, otherwise a random --neg-frac fraction of them."""
@@ -125,6 +135,7 @@ def train_rankers(df, use_cols, label, target, args):
             qids = make_query_ids(df, args.query_by, args.chunk_size, seed)
             skf = StratifiedGroupKFold(N_FOLDS, shuffle=True, random_state=seed)
             for tr_idx, va_idx in skf.split(df, y=label, groups=df[GROUP_COL]):
+                tr_idx = drop_low_label_groups(tr_idx, label, qids, args.min_group_label)
                 tr_idx = subsample_train(tr_idx, label, qids, rng, args)
                 tr_idx = tr_idx[np.argsort(qids[tr_idx], kind="stable")]  # groups must be contiguous
                 va_idx = va_idx[np.argsort(qids[va_idx], kind="stable")]  # validation uses FULL groups
@@ -180,6 +191,18 @@ def topk_recall(scores, patients, label, k):
     return in_top[label >= 2].mean(), in_top[label == 3].mean()
 
 
+def size_curve(oof, oof_logit, target):
+    """Ensemble pAUC (malignant) using only the first n seeds' OOF scores (5 models per seed)."""
+    n_seeds = len(oof)
+    sizes = sorted({n for n in (1, 2, 3, 5, 7, 9, 12) if n <= n_seeds} | {n_seeds})
+    print(f"\n  ensemble size (pAUC malignant; differences of a few 0.001 are within noise):")
+    print(f"  {'seeds (models)':22s}{'mean':>12s}{'platt_logit':>14s}")
+    for n in sizes:
+        vals = [custom_metric_raw(aggregate_scores(oof[:n], oof_logit[:n], m), target)
+                for m in ("mean", "platt_logit")]
+        print(f"  {f'{n} ({n * N_FOLDS})':22s}{vals[0]:>12.4f}{vals[1]:>14.4f}")
+
+
 def evaluate(oof, oof_logit, patients, target, label, k):
     """Competition pAUC (any malignant), melanoma-only pAUC and per-patient top-k recall,
     for single models and for each ensemble averaging method."""
@@ -220,7 +243,11 @@ def main():
                          "current top-N for its query. This is what focuses training on the top of each group.")
     ap.add_argument("--eval-at", type=int, default=15,
                     help="k for the reported validation NDCG@k and the per-patient top-k recall.")
-    ap.add_argument("--n-seeds", type=int, default=9, help="CV repeats (x5 folds = models).")
+    ap.add_argument("--min-group-label", type=int, default=0,
+                    help="Drop TRAINING queries whose max label is below this (2 = drop groups with no "
+                         "malignant lesion, 1 = drop groups with only plain-benign lesions, 0 = keep all).")
+    ap.add_argument("--n-seeds", type=int, default=5,
+                    help="CV repeats; models trained = n_seeds x 5 folds. See the ensemble-size table.")
     ap.add_argument("--artifact-dir", default=Path(ARTIFACT_DIR) / "ranker", help="Where models/OOF scores are saved.")
     ap.add_argument("--model_prefix", type=str, default="", help="Name prepended to saved files.")
     ap.add_argument("--lof-by-site", action="store_true", help="Compute per-anatomic-site LOF scores.")
@@ -245,6 +272,7 @@ def main():
     models, calibrators, val_ndcg, oof, oof_logit = train_rankers(df, use_cols, label, target, args)
     print(f"\n  validation NDCG@{args.eval_at} per model (full groups): {val_ndcg.mean():.4f} +/- {val_ndcg.std():.4f}")
     evaluate(oof, oof_logit, df[GROUP_COL].values, target, label, args.eval_at)
+    size_curve(oof, oof_logit, target)
 
     out_dir = Path(args.artifact_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
