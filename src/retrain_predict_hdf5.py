@@ -46,7 +46,7 @@ import retrain_predict
 from retrain_predict import (
     ISICModel, ISICModelEdgnet, _build_transforms, add_patient_norm,
     read_data, get_lof_score_pat_norm, get_lof_bysite_pat_norm, fill_inf, rank_average, 
-    custom_metric_raw, ensure_gbdt_artifacts,
+    custom_metric_raw, ensure_gbdt_artifacts, ensemble_predict,
     MODELS_DIR, EVA_MODEL_NAME, EVA_IMG_SIZE, EDG_MODEL_NAME, EDG_IMG_SIZE,
     cat_cols_base, ID_COL, TARGET_COL, GROUP_COL, TOP_FEATURES_PATH
 )
@@ -237,7 +237,8 @@ def predict_hdf5(
         batch_size=64, 
         num_workers=4,
         lof_by_site=False,
-        features_dict=None
+        features_dict=None,
+        ensemble="rank"
         ):
     feature_cols = artifacts["feature_cols"]
     columns_to_drop = artifacts["columns_to_drop"]
@@ -297,10 +298,7 @@ def predict_hdf5(
 
     # --- ensemble --------------------------------------------------------------
     print("Predicting with GBDT stack ...")
-    p_cb = rank_average(artifacts["models_cb"], X)
-    p_lgb = rank_average(artifacts["models_lgb"], X)
-    p_xgb = rank_average(artifacts["models_xgb"], X)
-    predictions = (p_cb + p_lgb + p_xgb) / 3.0
+    predictions = ensemble_predict(artifacts, X, ensemble)
 
     out = pd.DataFrame({ID_COL: df[ID_COL].values, "prediction": predictions})
     out.to_csv(output_csv, index=False)
@@ -332,6 +330,9 @@ def main():
                          "in metadata and a top_features_by_location.json file).")
     ap.add_argument("--top-features-path", type=Path, default=TOP_FEATURES_PATH,
                     help=f"Path to the per-site top-features JSON (default: {TOP_FEATURES_PATH}).")
+    ap.add_argument("--ensemble", choices=["rank", "calibrated"], default="rank",
+                    help="How to combine GBDT models: percentile-rank average (default) or average of "
+                         "per-model Platt-calibrated probabilities.")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -369,7 +370,8 @@ def main():
         args.batch_size, 
         args.num_workers,
         lof_by_site=args.lof_by_site,
-        features_dict=top_features_dict
+        features_dict=top_features_dict,
+        ensemble=args.ensemble
         )
     print("All done!")
 

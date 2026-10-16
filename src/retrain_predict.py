@@ -77,6 +77,7 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.neighbors import LocalOutlierFactor
 from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.metrics import roc_auc_score
+from sklearn.linear_model import LogisticRegression
 
 from imblearn.under_sampling import RandomUnderSampler
 from imblearn.over_sampling import RandomOverSampler
@@ -87,22 +88,27 @@ from imblearn.pipeline import Pipeline
 # Paths & global constants
 # ---------------------------------------------------------------------------
 # Root of the original Kaggle data (used only when training the GBDT stack).
-ROOT = Path("/home/gillism/Programs/ISIC Challenge 2024 Winners/kaggle/")
-PROJECT = Path("/home/gillism/Programs/ISIC Challenge 2024 Winners/1st Place New/")
+# All filesystem locations live in paths.json (repo root); edit that file, not this one.
+with open(Path(__file__).resolve().parent.parent / "paths.json") as _f:
+    _PATHS = json.load(_f)
 
-TRAIN_META_PATH = Path("/fast_data/schreym/data/raw/slice3d/train-metadata.csv") # read from /fast_data
+# Root of the original Kaggle data (used only when training the GBDT stack).
+ROOT = Path(_PATHS["ROOT"])
+PROJECT = Path(_PATHS["PROJECT"])
+
+TRAIN_META_PATH = Path(_PATHS["TRAIN_META_PATH"])
 
 # Directory holding the neural-net weights + OOF parquets shipped with the model.
-MODELS_DIR = PROJECT / "skin-models-base"
+MODELS_DIR = Path(_PATHS["MODELS_DIR"])
 # Where the trained GBDT stack (and the encoder / metadata) get cached.
-ARTIFACT_DIR = MODELS_DIR / "predict_artifacts"
+ARTIFACT_DIR = Path(_PATHS["ARTIFACT_DIR"])
 # Pre-computed top LightGBM features per body site
-TOP_FEATURES_PATH = "/home/schreym/isic2024/top_features_by_location.json"
+TOP_FEATURES_PATH = _PATHS["TOP_FEATURES_PATH"]
 
 # Parquet inputs required to TRAIN the GBDT stack (image features for the train set).
-OOF_EVA_PATH = MODELS_DIR / "oof_forecasts_eva.parquet"
-OOF_EDG_PATH = MODELS_DIR / "oof_forecasts_edgenext_base.parquet"
-OLD_PREDS_TRAIN_PATH = PROJECT / "old_data_model_forecast.parquet"
+OOF_EVA_PATH = Path(_PATHS["OOF_EVA_PATH"])
+OOF_EDG_PATH = Path(_PATHS["OOF_EDG_PATH"])
+OLD_PREDS_TRAIN_PATH = Path(_PATHS["OLD_PREDS_TRAIN_PATH"])
 
 ID_COL = "isic_id"
 TARGET_COL = "target"
@@ -702,10 +708,25 @@ def _build_training_frame(lof_by_site, features_dict):
     return df, feature_cols, onehot_cols, encoder, scaling
 
 
+def _logit(p, eps=1e-7):
+    """Clipped log-odds. For these binary-logloss GBDTs, logit(predict_proba) equals the
+    raw margin, and it is also available through the imblearn Pipeline wrapper."""
+    p = np.clip(p, eps, 1 - eps)
+    return np.log(p / (1 - p))
+
+
+def _fit_platt(model, va_x, va_y):
+    """Platt scaling: 1-feature logistic regression on the model's held-out log-odds.
+    The (unresampled, unjittered) validation fold gives true-prevalence probabilities."""
+    z = _logit(model.predict_proba(va_x)[:, 1]).reshape(-1, 1)
+    return LogisticRegression(C=1e6).fit(z, np.asarray(va_y))
+
+
 def _train_catboost(df, feature_cols, cat_cols, catboost_device):
-    """45 CatBoost models (9 seeds x 5 folds). Tries GPU, falls back to CPU."""
+    """45 CatBoost models (9 seeds x 5 folds) + a Platt calibrator per model, fit on
+    its held-out fold. Tries GPU, falls back to CPU."""
     use_cols = [c for c in feature_cols if c not in COLUMNS_TO_DROP]
-    models = []
+    models, calibrators = [], []
     task_type, devices = ("GPU", "0") if catboost_device == "gpu" else ("CPU", None)
     gpu_failed = False
 
@@ -748,15 +769,17 @@ def _train_catboost(df, feature_cols, cat_cols, catboost_device):
                     )
                     clf.fit(train_pool, eval_set=val_pool, verbose=False)
                 models.append(clf)
+                calibrators.append(_fit_platt(clf, va_x, va_y))
                 pbar.update(1)
-    return models
+    return models, calibrators
 
 
 def _train_sklearn_family(df, feature_cols, make_classifier, seed_offset, desc):
-    """45 LightGBM/XGBoost models wrapped in imblearn sampling pipelines.
+    """45 LightGBM/XGBoost models wrapped in imblearn sampling pipelines, plus a Platt
+    calibrator per model fit on its held-out fold.
     Jitter is applied to the image features BEFORE sampling (original order)."""
     use_cols = [c for c in feature_cols if c not in COLUMNS_TO_DROP]
-    models = []
+    models, calibrators = [], []
     with tqdm(total=45, desc=desc) as pbar:
         for seed in range(1, 10):
             rs = seed * 10 + seed_offset
@@ -774,8 +797,11 @@ def _train_sklearn_family(df, feature_cols, make_classifier, seed_offset, desc):
                 ])
                 model.fit(tr_x, tr_y)
                 models.append(model)
+                va_x = df.iloc[va_idx][use_cols].reset_index(drop=True)
+                va_y = df.iloc[va_idx][TARGET_COL].reset_index(drop=True)
+                calibrators.append(_fit_platt(model, va_x, va_y))
                 pbar.update(1)
-    return models
+    return models, calibrators
 
 
 def ensure_gbdt_artifacts(
@@ -791,13 +817,18 @@ def ensure_gbdt_artifacts(
     if manifest.exists() and not force_retrain:
         print(f"Found cached GBDT artifacts in {artifact_dir} — skipping training.")
         meta = joblib.load(manifest)
-        return {
+        arts = {
             "models_cb": joblib.load(artifact_dir / f"{model_prefix}models_cb.joblib"),
             "models_lgb": joblib.load(artifact_dir / f"{model_prefix}models_lgb.joblib"),
             "models_xgb": joblib.load(artifact_dir / f"{model_prefix}models_xgb.joblib"),
             "encoder": joblib.load(artifact_dir / f"{model_prefix}encoder.joblib"),
             **meta,
         }
+        for fam in ("cb", "lgb", "xgb"):
+            calib_path = artifact_dir / f"{model_prefix}calibrators_{fam}.joblib"
+            # Caches built before calibration existed have no calibrators (rank mode only).
+            arts[f"calibrators_{fam}"] = joblib.load(calib_path) if calib_path.exists() else None
+        return arts
 
     print("Training GBDT stack from scratch (one-time) ...")
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -806,16 +837,19 @@ def ensure_gbdt_artifacts(
     df, feature_cols, onehot_cols, encoder, scaling = _build_training_frame(lof_by_site, features_dict)
 
     print("  [train] CatBoost (45) ...")
-    models_cb = _train_catboost(df, feature_cols, onehot_cols, catboost_device)
+    models_cb, calib_cb = _train_catboost(df, feature_cols, onehot_cols, catboost_device)
     print("  [train] LightGBM (45) ...")
-    models_lgb = _train_sklearn_family(df, feature_cols, lambda: lgb.LGBMClassifier(**LGB_PARAMS), 17, "  lightgbm")
+    models_lgb, calib_lgb = _train_sklearn_family(df, feature_cols, lambda: lgb.LGBMClassifier(**LGB_PARAMS), 17, "  lightgbm")
     print("  [train] XGBoost (45) ...")
-    models_xgb = _train_sklearn_family(df, feature_cols, lambda: xgb.XGBClassifier(**XGB_PARAMS), 88, "  xgboost")
+    models_xgb, calib_xgb = _train_sklearn_family(df, feature_cols, lambda: xgb.XGBClassifier(**XGB_PARAMS), 88, "  xgboost")
 
     # Persist everything needed for prediction.
     joblib.dump(models_cb, artifact_dir / f"{model_prefix}models_cb.joblib")
     joblib.dump(models_lgb, artifact_dir / f"{model_prefix}models_lgb.joblib")
     joblib.dump(models_xgb, artifact_dir / f"{model_prefix}models_xgb.joblib")
+    joblib.dump(calib_cb, artifact_dir / f"{model_prefix}calibrators_cb.joblib")
+    joblib.dump(calib_lgb, artifact_dir / f"{model_prefix}calibrators_lgb.joblib")
+    joblib.dump(calib_xgb, artifact_dir / f"{model_prefix}calibrators_xgb.joblib")
     joblib.dump(encoder, artifact_dir / f"{model_prefix}encoder.joblib")
     meta = {
         "feature_cols": feature_cols,
@@ -827,6 +861,7 @@ def ensure_gbdt_artifacts(
     print(f"Saved GBDT artifacts to {artifact_dir}")
 
     return {"models_cb": models_cb, "models_lgb": models_lgb, "models_xgb": models_xgb,
+            "calibrators_cb": calib_cb, "calibrators_lgb": calib_lgb, "calibrators_xgb": calib_xgb,
             "encoder": encoder, **meta}
 
 
@@ -843,6 +878,33 @@ def rank_average(models, X):
     return acc / len(models)
 
 
+def calibrated_average(models, calibrators, X):
+    """Average Platt-calibrated probabilities across a family of models. Each model's
+    predict_proba is converted to log-odds and passed through its own calibrator."""
+    acc = None
+    for model, cal in zip(models, calibrators):
+        z = _logit(model.predict_proba(X)[:, 1]).reshape(-1, 1)
+        p = cal.predict_proba(z)[:, 1]
+        acc = p if acc is None else acc + p
+    return acc / len(models)
+
+
+def ensemble_predict(artifacts, X, method="rank"):
+    """Mean of the three family scores, using rank averaging or calibrated averaging."""
+    scores = []
+    for fam in ("cb", "lgb", "xgb"):
+        models = artifacts[f"models_{fam}"]
+        if method == "rank":
+            scores.append(rank_average(models, X))
+        else:
+            calibrators = artifacts.get(f"calibrators_{fam}")
+            if calibrators is None:
+                raise RuntimeError("No calibrators in the cached artifacts; rerun with --force-retrain "
+                                   "to fit them, or use --ensemble rank.")
+            scores.append(calibrated_average(models, calibrators, X))
+    return sum(scores) / len(scores)
+
+
 def predict(
         input_csv, 
         output_csv, 
@@ -851,7 +913,8 @@ def predict(
         batch_size=64, 
         num_workers=4,
         lof_by_site=False,
-        features_dict=None
+        features_dict=None,
+        ensemble="rank"
         ):
     feature_cols = artifacts["feature_cols"]
     columns_to_drop = artifacts["columns_to_drop"]
@@ -905,10 +968,7 @@ def predict(
 
     # --- ensemble --------------------------------------------------------------
     print("Predicting with GBDT stack ...")
-    p_cb = rank_average(artifacts["models_cb"], X)
-    p_lgb = rank_average(artifacts["models_lgb"], X)
-    p_xgb = rank_average(artifacts["models_xgb"], X)
-    predictions = (p_cb + p_lgb + p_xgb) / 3.0
+    predictions = ensemble_predict(artifacts, X, ensemble)
 
     out = pd.DataFrame({ID_COL: df[ID_COL].values, "prediction": predictions})
     out.to_csv(output_csv, index=False)
@@ -942,6 +1002,9 @@ def main():
                              "in metadata and a top_features_by_location.json file).")
     ap.add_argument("--top-features-path", type=Path, default=TOP_FEATURES_PATH,
                     help=f"Path to the per-site top-features JSON (default: {TOP_FEATURES_PATH}).")
+    ap.add_argument("--ensemble", choices=["rank", "calibrated"], default="rank",
+                    help="How to combine GBDT models: percentile-rank average (default) or average of "
+                         "per-model Platt-calibrated probabilities.")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -978,7 +1041,8 @@ def main():
         args.batch_size, 
         args.num_workers,
         lof_by_site=args.lof_by_site,
-        features_dict=top_features_dict
+        features_dict=top_features_dict,
+        ensemble=args.ensemble
         )
     print("All done!")
 

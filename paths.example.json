@@ -1,0 +1,11 @@
+{
+  "ROOT": "/path/to/kaggle/",
+  "PROJECT": "/path/to/project/",
+  "TRAIN_META_PATH": "/path/to/train-metadata.csv",
+  "MODELS_DIR": "/path/to/project/skin-models-base",
+  "ARTIFACT_DIR": "/path/to/project/skin-models-base/predict_artifacts",
+  "TOP_FEATURES_PATH": "/path/to/top_features_by_location.json",
+  "OOF_EVA_PATH": "/path/to/project/skin-models-base/oof_forecasts_eva.parquet",
+  "OOF_EDG_PATH": "/path/to/project/skin-models-base/oof_forecasts_edgenext_base.parquet",
+  "OLD_PREDS_TRAIN_PATH": "/path/to/project/old_data_model_forecast.parquet"
+}
