@@ -47,7 +47,7 @@ def main():
     ap.add_argument("--objective", choices=["lambdarank", "rank_xendcg"], default="lambdarank")
     ap.add_argument("--query-by", choices=["patient", "chunk"], default="patient")
     ap.add_argument("--chunk-size", type=int, default=5000)
-    ap.add_argument("--neg-frac", type=float, default=0.1)
+    ap.add_argument("--neg-frac", type=float, default=0.25)
     ap.add_argument("--neg-per-group", type=int, default=0)
     ap.add_argument("--truncation-level", type=int, default=30)
     ap.add_argument("--eval-at", type=int, default=15)

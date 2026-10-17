@@ -21,8 +21,8 @@ before averaging.
 
 Usage
 -----
-    python train_lgbm_ranker.py                                  # label_gain 0,1,3,7
-    python train_lgbm_ranker.py --label-gain 0,1,10,100 --model_prefix gain100_
+    python train_lgbm_ranker.py                                  # label_gain 0,1,10,100
+    python train_lgbm_ranker.py --label-gain 0,1,3,7 --model_prefix lowgain_
     python train_lgbm_ranker.py --query-by chunk --chunk-size 5000 --neg-frac 0.2
     python train_lgbm_ranker.py --objective rank_xendcg
     python train_lgbm_ranker.py --neg-per-group 50 --truncation-level 30 --eval-at 15
@@ -48,9 +48,11 @@ from retrain_predict import (
 
 # LightGBM >= 4.7 deprecates eval_set in favour of eval_X/eval_y; older versions only accept eval_set.
 warnings.filterwarnings("ignore", message=".*'eval_set' is deprecated.*")
+# LightGBM will use the `n_iter` alias for the official num_iterations argument
+warnings.filterwarnings("ignore", message=".*Found `n_iter` in params.*")
 
 N_FOLDS = 5
-DEFAULT_LABEL_GAIN = "0,1,3,7"
+DEFAULT_LABEL_GAIN = "0,1,10,100"
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +123,7 @@ def train_rankers(df, use_cols, label, target, args):
     with tqdm(total=args.n_seeds * N_FOLDS, desc="  lgbm-ranker") as pbar:
         for s in range(args.n_seeds):
             seed = s + 1
+
             rng = np.random.default_rng(seed)
             qids = make_query_ids(df, args.query_by, args.chunk_size, seed)
             skf = StratifiedGroupKFold(N_FOLDS, shuffle=True, random_state=seed)
@@ -208,7 +211,7 @@ def main():
     ap.add_argument("--query-by", choices=["patient", "chunk"], default="patient",
                     help="Query groups: one per patient, or random whole-patient chunks of --chunk-size lesions.")
     ap.add_argument("--chunk-size", type=int, default=5000, help="Approx. lesions per query for --query-by chunk.")
-    ap.add_argument("--neg-frac", type=float, default=1.0,
+    ap.add_argument("--neg-frac", type=float, default=0.1,
                     help="Fraction of label-0 training rows kept (labels 1-3 are always kept).")
     ap.add_argument("--neg-per-group", type=int, default=0,
                     help="If > 0, keep at most this many label-0 rows per query (overrides --neg-frac).")
@@ -220,7 +223,7 @@ def main():
                          "current top-N for its query. This is what focuses training on the top of each group.")
     ap.add_argument("--eval-at", type=int, default=15,
                     help="k for the reported validation NDCG@k and the per-patient top-k recall.")
-    ap.add_argument("--n-seeds", type=int, default=9, help="CV repeats (x5 folds = models).")
+    ap.add_argument("--n-seeds", type=int, default=10, help="CV repeats (x5 folds = models).")
     ap.add_argument("--artifact-dir", default=Path(ARTIFACT_DIR), help="Where models/OOF scores are saved.")
     ap.add_argument("--model_prefix", type=str, default="", help="Name prepended to saved files.")
     ap.add_argument("--lof-by-site", action="store_true", help="Compute per-anatomic-site LOF scores.")
