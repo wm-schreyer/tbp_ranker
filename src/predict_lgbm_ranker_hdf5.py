@@ -199,8 +199,8 @@ def main():
     ap.add_argument("--model_prefix", type=str, default="", help="Prefix used when the rankers were trained.")
     ap.add_argument("--ensemble", choices=METHODS, default="platt_logit",
                     help="Averaging method written to the `prediction` column (all methods are saved).")
-    ap.add_argument("--cnn-cache", type=Path, default=None,
-                    help="Parquet cache of raw CNN outputs (default: <input>_cnn_outputs.parquet next to --input).")
+    ap.add_argument("--cnn-cache", type=Path, default=Path(ARTIFACT_DIR) / "test_cnn_outputs.parquet",
+                    help="Parquet cache of raw CNN outputs (default: <artifact_dir>/test_cnn_outputs.parquet).")
     ap.add_argument("--refresh-cnn-cache", action="store_true", help="Recompute CNN outputs even if cached.")
     ap.add_argument("--eval-at", type=int, default=15, help="k for per-patient top-k recall.")
     ap.add_argument("--batch-size", type=int, default=64)
@@ -215,7 +215,7 @@ def main():
     with open(args.top_features_path, "r") as f:
         top_features_dict = json.load(f)
 
-    cnn_cache = args.cnn_cache or Path(args.input).with_name(Path(args.input).stem + "_cnn_outputs.parquet")
+    cnn_cache = args.cnn_cache or Path(args.artifact_dir) / "test_cnn_outputs.parquet"
     models, calibrators, meta = load_ranker_artifacts(args.artifact_dir, args.model_prefix)
     df, X = build_feature_matrix(args.input, args.images, meta, device, args.batch_size, args.num_workers,
                                  args.lof_by_site, top_features_dict, cnn_cache, args.refresh_cnn_cache)
