@@ -9,6 +9,13 @@ features, LOF, EVA/EdgeNeXt image features) is run before the rankers.
 Needs the artifacts written by train_lgbm_ranker.py in --artifact-dir:
     {prefix}ranker_models.joblib, {prefix}ranker_calibrators.joblib, {prefix}ranker_meta.joblib
 
+The slow part is the CNN inference (EVA02 3-class 'old set' model, EVA02 5 folds, EdgeNeXt 5
+folds). Their RAW outputs are cached per isic_id in a parquet (--cnn-cache, default
+`<input>_cnn_outputs.parquet`): computed and saved when missing, loaded when present. Lesions
+absent from an existing cache are computed and appended. Scaling and patient-normalisation are
+applied after loading, so the cache stays valid across rankers; delete it (or use
+--refresh-cnn-cache) if the CNN weights or the images change.
+
 Output CSV: isic_id, patient_id, `prediction` (the --ensemble you chose) and one column per
 averaging method (mean, zscore, rank, platt_logit, platt_prob). Notes:
   * zscore and rank are computed over THIS input file, so they depend on the dataset scored;
@@ -22,6 +29,7 @@ Usage
         --model_prefix gain100_ --output ranker_preds.csv
 """
 import argparse
+import gc
 import json
 from pathlib import Path
 
@@ -32,10 +40,12 @@ import pandas as pd
 import torch
 
 from retrain_predict import (
-    read_data, get_lof_score_pat_norm, get_lof_bysite_pat_norm, fill_inf, custom_metric_raw,
+    ISICModel, ISICModelEdgnet, add_patient_norm, read_data, get_lof_score_pat_norm,
+    get_lof_bysite_pat_norm, fill_inf, custom_metric_raw,
+    MODELS_DIR, EVA_MODEL_NAME, EVA_IMG_SIZE, EDG_MODEL_NAME, EDG_IMG_SIZE,
     cat_cols_base, ID_COL, TARGET_COL, GROUP_COL, ARTIFACT_DIR, TOP_FEATURES_PATH,
 )
-from retrain_predict_hdf5 import compute_image_features_hdf5
+from retrain_predict_hdf5 import _infer_hdf5
 from train_lgbm_ranker import METHODS, aggregate_scores, build_relevance_labels, topk_recall
 
 
@@ -48,7 +58,70 @@ def load_ranker_artifacts(artifact_dir, prefix):
     return models, calibrators, meta
 
 
-def build_feature_matrix(input_csv, hdf5_path, meta, device, batch_size, num_workers, lof_by_site, features_dict):
+def _run_cnn(model, ckpt, ids, hdf5_path, img_size, device, batch_size, num_workers):
+    """Load one checkpoint, run it over `ids`, free it. (_infer_hdf5 squeezes, so 1 id is padded.)"""
+    model = model.to(device)
+    model.load_state_dict(torch.load(MODELS_DIR / ckpt, weights_only=True))
+    padded = ids if len(ids) > 1 else ids * 2
+    out = _infer_hdf5(model, padded, hdf5_path, img_size, device, batch_size, num_workers)[:len(ids)]
+    model.to("cpu"); del model; gc.collect(); torch.cuda.empty_cache()
+    return out
+
+
+def compute_raw_cnn_outputs(ids, hdf5_path, device, batch_size, num_workers):
+    """Raw (unscaled) outputs of the CNNs: old_0..2, eva_0..4, edg_0..4, one row per isic_id."""
+    out = {ID_COL: list(ids)}
+    print("  [image] EVA02 3-class 'old set' model ...")
+    preds3 = _run_cnn(ISICModel(EVA_MODEL_NAME, pretrained=False, num_classes=3), "ema_small_pretrained",
+                      ids, hdf5_path, EVA_IMG_SIZE, device, batch_size, num_workers)
+    for k in range(3):
+        out[f"old_{k}"] = preds3[:, k]
+    print("  [image] EVA02 5 folds ...")
+    for fold in range(5):
+        out[f"eva_{fold}"] = _run_cnn(ISICModel(EVA_MODEL_NAME, pretrained=False, num_classes=1), f"eva_model__{fold}",
+                                      ids, hdf5_path, EVA_IMG_SIZE, device, batch_size, num_workers)
+    print("  [image] EdgeNeXt 5 folds ...")
+    for fold in range(5):
+        out[f"edg_{fold}"] = _run_cnn(ISICModelEdgnet(EDG_MODEL_NAME, pretrained=False, num_classes=1), f"edg_model__{fold}",
+                                      ids, hdf5_path, EDG_IMG_SIZE, device, batch_size, num_workers)
+    return pd.DataFrame(out)
+
+
+def load_or_compute_cnn_outputs(ids, cache_path, hdf5_path, device, batch_size, num_workers, refresh=False):
+    """Raw CNN outputs for `ids` (in that order): from the parquet cache where present, computed
+    (and appended to the cache) for any ids that are missing."""
+    cache_path = Path(cache_path)
+    cache = pd.read_parquet(cache_path) if cache_path.exists() and not refresh else None
+    have = set(cache[ID_COL]) if cache is not None else set()
+    missing = [i for i in ids if i not in have]
+    if missing:
+        print(f"  [cnn cache] computing {len(missing)} of {len(ids)} lesions ...")
+        new = compute_raw_cnn_outputs(missing, hdf5_path, device, batch_size, num_workers)
+        cache = new if cache is None else pd.concat([cache, new], ignore_index=True)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache.to_parquet(cache_path, index=False)
+        print(f"  [cnn cache] saved {len(cache)} lesions to {cache_path}")
+    else:
+        print(f"  [cnn cache] loaded all {len(ids)} lesions from {cache_path}")
+    return cache.drop_duplicates(ID_COL).set_index(ID_COL).loc[ids].reset_index()
+
+
+def image_features_from_cnn(df, cnn, scaling):
+    """Same features as compute_image_features_hdf5, built from raw CNN outputs: old_set_0..2 (+ _m),
+    predictions_eva (+ _m), predictions_edg (+ _m). `df` has isic_id and patient_id."""
+    cnn = cnn.set_index(ID_COL).loc[df[ID_COL]]
+    for k in range(3):
+        df[f"old_set_{k}"] = cnn[f"old_{k}"].values
+        df = add_patient_norm(df, f"old_set_{k}", f"old_set_{k}_m")
+    for name, key in (("eva", "predictions_eva"), ("edg", "predictions_edg")):
+        scaled = [(cnn[f"{name}_{f}"].values - scaling[f"{name}_mean"]) / scaling[f"{name}_std"] for f in range(5)]
+        df[key] = np.mean(scaled, axis=0)
+        df = add_patient_norm(df, key, f"{key}_m")
+    return df
+
+
+def build_feature_matrix(input_csv, hdf5_path, meta, device, batch_size, num_workers, lof_by_site, features_dict,
+                         cnn_cache, refresh_cnn_cache=False):
     """Same feature pipeline as predict_hdf5. Returns (frame, X) with X = the model columns."""
     raw = pd.read_csv(input_csv)
     for required in (ID_COL, GROUP_COL):
@@ -79,7 +152,9 @@ def build_feature_matrix(input_csv, hdf5_path, meta, device, batch_size, num_wor
 
     print("Running image models ...")
     img = raw[[ID_COL, GROUP_COL]].copy()
-    img = compute_image_features_hdf5(img, hdf5_path, device, meta["scaling"], batch_size, num_workers)
+    cnn = load_or_compute_cnn_outputs(raw[ID_COL].tolist(), cnn_cache, hdf5_path, device, batch_size,
+                                      num_workers, refresh_cnn_cache)
+    img = image_features_from_cnn(img, cnn, meta["scaling"])
     image_cols = [c for c in img.columns if c not in (ID_COL, GROUP_COL)]
     df = df.merge(img[[ID_COL] + image_cols], how="left", on=ID_COL)
 
@@ -120,10 +195,13 @@ def main():
     ap.add_argument("--input", required=True, help="Metadata CSV (isic_id, patient_id, tabular columns; target optional).")
     ap.add_argument("--images", required=True, help="HDF5 file of images keyed by isic_id (JPEG bytes).")
     ap.add_argument("--output", default="ranker_predictions.csv", help="Where to write the prediction CSV.")
-    ap.add_argument("--artifact-dir", default=Path(ARTIFACT_DIR) / "ranker", help="Directory with the ranker artifacts.")
+    ap.add_argument("--artifact-dir", default=Path(ARTIFACT_DIR), help="Directory with the ranker artifacts.")
     ap.add_argument("--model_prefix", type=str, default="", help="Prefix used when the rankers were trained.")
     ap.add_argument("--ensemble", choices=METHODS, default="platt_logit",
                     help="Averaging method written to the `prediction` column (all methods are saved).")
+    ap.add_argument("--cnn-cache", type=Path, default=None,
+                    help="Parquet cache of raw CNN outputs (default: <input>_cnn_outputs.parquet next to --input).")
+    ap.add_argument("--refresh-cnn-cache", action="store_true", help="Recompute CNN outputs even if cached.")
     ap.add_argument("--eval-at", type=int, default=15, help="k for per-patient top-k recall.")
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--num-workers", type=int, default=4)
@@ -137,9 +215,10 @@ def main():
     with open(args.top_features_path, "r") as f:
         top_features_dict = json.load(f)
 
+    cnn_cache = args.cnn_cache or Path(args.input).with_name(Path(args.input).stem + "_cnn_outputs.parquet")
     models, calibrators, meta = load_ranker_artifacts(args.artifact_dir, args.model_prefix)
     df, X = build_feature_matrix(args.input, args.images, meta, device, args.batch_size, args.num_workers,
-                                 args.lof_by_site, top_features_dict)
+                                 args.lof_by_site, top_features_dict, cnn_cache, args.refresh_cnn_cache)
 
     print(f"Scoring {len(X)} lesions with {len(models)} rankers ...")
     scores, logits = score_models(models, calibrators, X)
