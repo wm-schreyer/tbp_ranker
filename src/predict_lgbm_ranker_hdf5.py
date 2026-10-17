@@ -195,7 +195,7 @@ def main():
     ap.add_argument("--input", required=True, help="Metadata CSV (isic_id, patient_id, tabular columns; target optional).")
     ap.add_argument("--images", required=True, help="HDF5 file of images keyed by isic_id (JPEG bytes).")
     ap.add_argument("--output", default="ranker_predictions.csv", help="Where to write the prediction CSV.")
-    ap.add_argument("--artifact-dir", default=Path(ARTIFACT_DIR), help="Directory with the ranker artifacts.")
+    ap.add_argument("--artifact-dir", default=Path(ARTIFACT_DIR) / "ranker", help="Directory with the ranker artifacts.")
     ap.add_argument("--model_prefix", type=str, default="", help="Prefix used when the rankers were trained.")
     ap.add_argument("--ensemble", choices=METHODS, default="platt_logit",
                     help="Averaging method written to the `prediction` column (all methods are saved).")
@@ -215,7 +215,7 @@ def main():
     with open(args.top_features_path, "r") as f:
         top_features_dict = json.load(f)
 
-    cnn_cache = args.cnn_cache or Path(args.artifact_dir) / "test_cnn_outputs.parquet"
+    cnn_cache = args.cnn_cache
     models, calibrators, meta = load_ranker_artifacts(args.artifact_dir, args.model_prefix)
     df, X = build_feature_matrix(args.input, args.images, meta, device, args.batch_size, args.num_workers,
                                  args.lof_by_site, top_features_dict, cnn_cache, args.refresh_cnn_cache)
