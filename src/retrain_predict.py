@@ -457,9 +457,9 @@ def read_data(path):
     )
 
 
-def get_lof_score_pat_norm(df, k=15):
+def get_lof_score_pat_norm(df, k=15, null=0.0):
     """Per-patient Local Outlier Factor score (`of`). Patients with <= k images are
-    left at the default 0.0. Expects `isic_id` as the index and a `patient_id` col."""
+    left at the default "null" arg value. Expects `isic_id` as the index and a `patient_id` col."""
     top_lof_features = [
         "tbp_lv_H", "hue_contrast", "age_normalized_nevi_confidence_2", "tbp_lv_deltaB",
         "color_uniformity", "tbp_lv_z", "clin_size_long_diam_mm", "tbp_lv_y",
@@ -483,7 +483,7 @@ def get_lof_score_pat_norm(df, k=15):
 
         # subset patient features
         X_pat = lof_feat[mask]
-        X_pat = X_pat.fillna(X_pat.median()).fillna(0.0)
+        X_pat = X_pat.fillna(X_pat.median()).fillna(0.0) # in this case we always sub NaN median for 0
 
         # scale once per patient
         pat_scaled = np.nan_to_num(StandardScaler().fit_transform(X_pat))
@@ -497,13 +497,13 @@ def get_lof_score_pat_norm(df, k=15):
         }))
 
     if not factors:
-        df["of"] = 0.0 # null value outside of typical LOF range
+        df["of"] = null # value outside of typical LOF range
         return df
     
     factors = pd.concat(factors).set_index("isic_id")
     df = df.merge(factors, how="left", left_index=True, right_index=True)
     
-    df["of"] = df["of"].fillna(0.0) # replace any remaining NA values
+    df["of"] = df["of"].fillna(null) # replace any remaining NA values
     
     return df
 
@@ -514,7 +514,8 @@ def get_lof_bysite_pat_norm(
         output_col_name="of_site", 
         patient_col="patient_id",
         site_col="anatom_site_general",
-        k=15
+        k=15,
+        null=0.0
         ):
     """
     Calculates a Local Outlier Factor score for TBP tiles using features dervied from VECTRA lesion analyzer measurements.
@@ -543,7 +544,7 @@ def get_lof_bysite_pat_norm(
             outlier_factors.append(
                 pd.DataFrame({
                     "isic_id": site_ids,
-                    output_col_name: 0.0,
+                    output_col_name: null, # uses null LOF score for continuity
                 })
             )
             continue
@@ -570,7 +571,7 @@ def get_lof_bysite_pat_norm(
                 outlier_factors.append(
                     pd.DataFrame({
                         "isic_id": site_ids,
-                        output_col_name: 0.0,
+                        output_col_name: null,
                     })
                 )
                 continue
@@ -582,7 +583,7 @@ def get_lof_bysite_pat_norm(
                 outlier_factors.append(
                     pd.DataFrame({
                         "isic_id": site_ids,
-                        output_col_name: 0.0,
+                        output_col_name: null,
                     })
                 )
                 continue
@@ -598,7 +599,7 @@ def get_lof_bysite_pat_norm(
 
     # Edge case: no groups processed at all
     if len(outlier_factors) == 0:
-        dataframe[output_col_name] = 0.0
+        dataframe[output_col_name] = null
         return dataframe
     
     # Stitch all groups back together and merge onto original dataframe
@@ -636,7 +637,7 @@ def custom_metric_raw(y_hat, y_true):
 # ===========================================================================
 # PHASE 1 — train the GBDT stack once and cache it
 # ===========================================================================
-def _build_training_frame(lof_by_site, features_dict):
+def _build_training_frame(lof_by_site, lof_null, features_dict):
     """Assemble df_train exactly as the original script did, but pulling the image
     features from the precomputed OOF parquets (no neural nets needed here)."""
     print("  [train] engineering tabular features ...")
@@ -662,10 +663,11 @@ def _build_training_frame(lof_by_site, features_dict):
             output_col_name="of",
             patient_col="patient_id",
             site_col="anatom_site_general",
+            null=lof_null
             )
     else:
         print("  [train] computing LOF total body...")
-        df = get_lof_score_pat_norm(df)
+        df = get_lof_score_pat_norm(df, null=lof_null)
     df = df.reset_index()
     feature_cols = feature_cols + ["of"]
 
@@ -810,6 +812,7 @@ def ensure_gbdt_artifacts(
         artifact_dir=None, 
         model_prefix="", 
         lof_by_site=None,
+        lof_null=0.0,
         features_dict=None,
         ):
     """Load the cached GBDT stack, or train + cache it if missing."""
@@ -834,7 +837,7 @@ def ensure_gbdt_artifacts(
     artifact_dir.mkdir(parents=True, exist_ok=True)
     set_seed(SEED)
 
-    df, feature_cols, onehot_cols, encoder, scaling = _build_training_frame(lof_by_site, features_dict)
+    df, feature_cols, onehot_cols, encoder, scaling = _build_training_frame(lof_by_site, lof_null, features_dict)
 
     print("  [train] CatBoost (45) ...")
     models_cb, calib_cb = _train_catboost(df, feature_cols, onehot_cols, catboost_device)
@@ -913,6 +916,7 @@ def predict(
         batch_size=64, 
         num_workers=4,
         lof_by_site=False,
+        lof_null=0.0,
         features_dict=None,
         ensemble="rank"
         ):
@@ -945,10 +949,11 @@ def predict(
             output_col_name="of",
             patient_col="patient_id",
             site_col="anatom_site_general",
+            null=lof_null
             )
     else:
         print("Computing LOF total body...")
-        df = get_lof_score_pat_norm(df)
+        df = get_lof_score_pat_norm(df, null=lof_null)
     df = df.reset_index()
     
     # --- image features (neural nets) -----------------------------------------
@@ -1000,6 +1005,7 @@ def main():
     ap.add_argument("--lof-by-site", action="store_true",
                         help="Also compute per-anatomic-site LOF scores (requires 'anatom_site_general' "
                              "in metadata and a top_features_by_location.json file).")
+    ap.add_argument("--lof-null", type=float, default=0.0)
     ap.add_argument("--top-features-path", type=Path, default=TOP_FEATURES_PATH,
                     help=f"Path to the per-site top-features JSON (default: {TOP_FEATURES_PATH}).")
     ap.add_argument("--ensemble", choices=["rank", "calibrated"], default="rank",
@@ -1024,6 +1030,7 @@ def main():
         artifact_dir=arti_dir,
         model_prefix=args.model_prefix, 
         lof_by_site=args.lof_by_site,
+        lof_null=args.lof_null,
         features_dict=top_features_dict
         )
 
@@ -1041,6 +1048,7 @@ def main():
         args.batch_size, 
         args.num_workers,
         lof_by_site=args.lof_by_site,
+        lof_null=args.lof_null,
         features_dict=top_features_dict,
         ensemble=args.ensemble
         )

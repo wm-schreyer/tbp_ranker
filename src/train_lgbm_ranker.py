@@ -66,7 +66,7 @@ def build_relevance_labels(df):
 
     label = np.zeros(len(df), dtype=int)
     label[(target == 0) & has_lesion_id] = 1
-    label[target == 1] = 2
+    label[(target == 1) & ~is_melanoma] = 2 # non-melanoma malignancies
     label[(target == 1) & is_melanoma] = 3
     return label
 
@@ -227,6 +227,7 @@ def main():
     ap.add_argument("--artifact-dir", default=Path(ARTIFACT_DIR), help="Where models/OOF scores are saved.")
     ap.add_argument("--model_prefix", type=str, default="", help="Name prepended to saved files.")
     ap.add_argument("--lof-by-site", action="store_true", help="Compute per-anatomic-site LOF scores.")
+    ap.add_argument("--lof-null", type=float, default=0.0)
     ap.add_argument("--top-features-path", type=Path, default=TOP_FEATURES_PATH,
                     help=f"Per-site top-features JSON (default: {TOP_FEATURES_PATH}).")
     args = ap.parse_args()
@@ -238,7 +239,7 @@ def main():
     with open(args.top_features_path, "r") as f:
         top_features_dict = json.load(f)
 
-    df, feature_cols, onehot_cols, encoder, scaling = _build_training_frame(args.lof_by_site, top_features_dict)
+    df, feature_cols, onehot_cols, encoder, scaling = _build_training_frame(args.lof_by_site, args.lof_null, top_features_dict)
     use_cols = [c for c in feature_cols if c not in COLUMNS_TO_DROP]
 
     label = build_relevance_labels(df)

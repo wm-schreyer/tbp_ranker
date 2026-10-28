@@ -147,7 +147,8 @@ def get_lof_bysite(
         output_col_name="of", 
         patient_col="patient_id",
         site_col="anatom_site_general",
-        min_tiles=15
+        k=15,
+        null=0.0
         ):
     """
     Calculates a Local Outlier Factor score for TBP tiles using features dervied from VECTRA lesion analyzer measurements.
@@ -164,12 +165,12 @@ def get_lof_bysite(
     for (patient_id, site), idx in dataframe.groupby(group_keys, observed=True).indices.items():
         row_ids = dataframe.index.values[idx]
 
-        # No matching site key: return -1 for all rows in this group
+        # No matching site key: return null LOF score for all rows in this group
         if site not in top_features_dict:
             outlier_factors.append(
                 pd.DataFrame({
                     "isic_id": row_ids,
-                    output_col_name: -1.0,
+                    output_col_name: null,
                     #f"exception_{output_col_name}": "no_site_key",
                 })
             )
@@ -183,19 +184,20 @@ def get_lof_bysite(
         lof_feat = lof_feat.fillna(lof_feat.median()).fillna(0.0)
         scaled_array = np.nan_to_num(StandardScaler().fit_transform(lof_feat))
 
-        # Insufficient tiles: return -1
-        if len(idx) < min_tiles:
+        # Insufficient tiles: return null LOF score
+        if len(idx) <= k:
             outlier_factors.append(
                 pd.DataFrame({
                     "isic_id": row_ids,
-                    output_col_name: -1.0,
+                    output_col_name: null,
                     #f"exception_{output_col_name}": "insufficient_tiles",
                 })
             )
             continue
 
         # Valid group: compute LOF
-        clf = LocalOutlierFactor(n_neighbors=min(35, len(idx)))
+        #clf = LocalOutlierFactor(n_neighbors=min(35, len(idx)))
+        clf = LocalOutlierFactor(n_neighbors=k)
         clf.fit_predict(scaled_array[idx])
         outlier_factors.append(
             pd.DataFrame({
@@ -207,7 +209,7 @@ def get_lof_bysite(
 
     # Edge case: no groups processed at all
     if len(outlier_factors) == 0:
-        dataframe[output_col_name] = -1.0
+        dataframe[output_col_name] = null
         #dataframe[f"exception_{output_col_name}"] = "no_valid_groups"
         return dataframe
     
@@ -221,8 +223,8 @@ def get_lof_bysite(
     )
 
     # Catch any rows that fell through the merge (e.g. null site values)
-    # and fill with -1 so the GBDT stack never sees a null
-    dataframe[output_col_name] = dataframe[output_col_name].fillna(-1.0)
+    # and fill with null so the GBDT stack never sees a null
+    dataframe[output_col_name] = dataframe[output_col_name].fillna(null)
     #dataframe[f"exception_{output_col_name}"] = dataframe[f"exception_{output_col_name}"].fillna("null_site")
 
     return dataframe
@@ -237,6 +239,7 @@ def predict_hdf5(
         batch_size=64, 
         num_workers=4,
         lof_by_site=False,
+        lof_null=0.0,
         features_dict=None,
         ensemble="rank"
         ):
@@ -276,9 +279,10 @@ def predict_hdf5(
             output_col_name="of",
             patient_col="patient_id",
             site_col="anatom_site_general",
+            null=lof_null
         )
     else:
-        df = get_lof_score_pat_norm(df)
+        df = get_lof_score_pat_norm(df, null=lof_null)
     df = df.reset_index()
 
     # --- image features (neural nets, read from HDF5) --------------------------
@@ -328,6 +332,7 @@ def main():
     ap.add_argument("--lof-by-site", action="store_true",
                     help="Also compute per-anatomic-site LOF scores (requires 'anatom_site_general' "
                          "in metadata and a top_features_by_location.json file).")
+    ap.add_argument("--lof-null", type=float, default=0.0)
     ap.add_argument("--top-features-path", type=Path, default=TOP_FEATURES_PATH,
                     help=f"Path to the per-site top-features JSON (default: {TOP_FEATURES_PATH}).")
     ap.add_argument("--ensemble", choices=["rank", "calibrated"], default="rank",
@@ -352,6 +357,7 @@ def main():
         artifact_dir=arti_dir,
         model_prefix=args.model_prefix,
         lof_by_site=args.lof_by_site,
+        lof_null=args.lof_null,
         features_dict=top_features_dict,
         )
 
@@ -370,6 +376,7 @@ def main():
         args.batch_size, 
         args.num_workers,
         lof_by_site=args.lof_by_site,
+        lof_null=args.lof_null,
         features_dict=top_features_dict,
         ensemble=args.ensemble
         )

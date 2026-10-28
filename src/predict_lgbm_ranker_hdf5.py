@@ -120,8 +120,8 @@ def image_features_from_cnn(df, cnn, scaling):
     return df
 
 
-def build_feature_matrix(input_csv, hdf5_path, meta, device, batch_size, num_workers, lof_by_site, features_dict,
-                         cnn_cache, refresh_cnn_cache=False):
+def build_feature_matrix(input_csv, hdf5_path, meta, device, batch_size, num_workers, lof_by_site, lof_null,
+                         features_dict, cnn_cache, refresh_cnn_cache=False):
     """Same feature pipeline as predict_hdf5. Returns (frame, X) with X = the model columns."""
     raw = pd.read_csv(input_csv)
     for required in (ID_COL, GROUP_COL):
@@ -145,9 +145,10 @@ def build_feature_matrix(input_csv, hdf5_path, meta, device, batch_size, num_wor
     df = df.set_index(ID_COL)
     if lof_by_site:
         df = get_lof_bysite_pat_norm(df, top_features_dict=features_dict, output_col_name="of",
-                                     patient_col="patient_id", site_col="anatom_site_general")
+                                     patient_col="patient_id", site_col="anatom_site_general",
+                                     null=lof_null)
     else:
-        df = get_lof_score_pat_norm(df)
+        df = get_lof_score_pat_norm(df, null=lof_null)
     df = df.reset_index()
 
     print("Running image models ...")
@@ -205,6 +206,7 @@ def main():
     ap.add_argument("--eval-at", type=int, default=15, help="k for per-patient top-k recall.")
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--num-workers", type=int, default=4)
+    ap.add_argument("--lof-null", type=float, default=0.0)
     ap.add_argument("--lof-by-site", action="store_true",
                     help="Per-anatomic-site LOF; must match how the rankers were trained.")
     ap.add_argument("--top-features-path", type=Path, default=TOP_FEATURES_PATH)
@@ -218,7 +220,7 @@ def main():
     cnn_cache = args.cnn_cache
     models, calibrators, meta = load_ranker_artifacts(args.artifact_dir, args.model_prefix)
     df, X = build_feature_matrix(args.input, args.images, meta, device, args.batch_size, args.num_workers,
-                                 args.lof_by_site, top_features_dict, cnn_cache, args.refresh_cnn_cache)
+                                 args.lof_by_site, args.lof_null, top_features_dict, cnn_cache, args.refresh_cnn_cache)
 
     print(f"Scoring {len(X)} lesions with {len(models)} rankers ...")
     scores, logits = score_models(models, calibrators, X)
