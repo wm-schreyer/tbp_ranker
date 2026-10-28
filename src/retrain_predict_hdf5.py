@@ -95,49 +95,65 @@ def _infer_hdf5(model, isic_ids, hdf5_path, img_size, device, batch_size=64, num
     return np.concatenate(out)
 
 
-def compute_image_features_hdf5(df, hdf5_path, device, scaling, batch_size=64, num_workers=4):
-    """HDF5 counterpart of predict.compute_image_features.
+def _run_cnn(model, ckpt, ids, hdf5_path, img_size, device, batch_size, num_workers):
+    """Load one checkpoint, run it over `ids`, free it. (_infer_hdf5 squeezes, so 1 id is padded.)"""
+    model = model.to(device)
+    model.load_state_dict(torch.load(MODELS_DIR / ckpt, weights_only=True))
+    padded = ids if len(ids) > 1 else ids * 2
+    out = _infer_hdf5(model, padded, hdf5_path, img_size, device, batch_size, num_workers)[:len(ids)]
+    model.to("cpu"); del model; gc.collect(); torch.cuda.empty_cache()
+    return out
 
-    `df` must contain `isic_id` and `patient_id`. Adds: old_set_0/1/2 (+ _m),
-    predictions_eva (+ _m), predictions_edg (+ _m). Predictions are produced in
-    `df` row order and assigned back positionally (loader uses shuffle=False).
-    """
-    isic_ids = df[ID_COL].values
 
-    # --- 1) EVA02 3-class "old set" model --------------------------------------
+def compute_raw_cnn_outputs(ids, hdf5_path, device, batch_size, num_workers):
+    """Raw (unscaled) outputs of the CNNs: old_0..2, eva_0..4, edg_0..4, one row per isic_id."""
+    out = {ID_COL: list(ids)}
     print("  [image] EVA02 3-class 'old set' model ...")
-    m = ISICModel(EVA_MODEL_NAME, pretrained=False, num_classes=3).to(device)
-    m.load_state_dict(torch.load(MODELS_DIR / "ema_small_pretrained", weights_only=True))
-    preds3 = _infer_hdf5(m, isic_ids, hdf5_path, EVA_IMG_SIZE, device, batch_size, num_workers)
-    m.to("cpu"); del m; gc.collect(); torch.cuda.empty_cache()
+    preds3 = _run_cnn(ISICModel(EVA_MODEL_NAME, pretrained=False, num_classes=3), "ema_small_pretrained",
+                      ids, hdf5_path, EVA_IMG_SIZE, device, batch_size, num_workers)
     for k in range(3):
-        df[f"old_set_{k}"] = preds3[:, k]
-        df = add_patient_norm(df, f"old_set_{k}", f"old_set_{k}_m")
-
-    # --- 2) EVA02 5-fold malignancy model --------------------------------------
+        out[f"old_{k}"] = preds3[:, k]
     print("  [image] EVA02 5 folds ...")
-    eva_scaled = []
     for fold in range(5):
-        m = ISICModel(EVA_MODEL_NAME, pretrained=False, num_classes=1).to(device)
-        m.load_state_dict(torch.load(MODELS_DIR / f"eva_model__{fold}", weights_only=True))
-        raw = _infer_hdf5(m, isic_ids, hdf5_path, EVA_IMG_SIZE, device, batch_size, num_workers)
-        m.to("cpu"); del m; gc.collect(); torch.cuda.empty_cache()
-        eva_scaled.append((raw - scaling["eva_mean"]) / scaling["eva_std"])
-    df["predictions_eva"] = np.mean(eva_scaled, axis=0)
-    df = add_patient_norm(df, "predictions_eva", "predictions_eva_m")
-
-    # --- 3) EdgeNeXt 5-fold malignancy model -----------------------------------
+        out[f"eva_{fold}"] = _run_cnn(ISICModel(EVA_MODEL_NAME, pretrained=False, num_classes=1), f"eva_model__{fold}",
+                                      ids, hdf5_path, EVA_IMG_SIZE, device, batch_size, num_workers)
     print("  [image] EdgeNeXt 5 folds ...")
-    edg_scaled = []
     for fold in range(5):
-        m = ISICModelEdgnet(EDG_MODEL_NAME, pretrained=False, num_classes=1).to(device)
-        m.load_state_dict(torch.load(MODELS_DIR / f"edg_model__{fold}", weights_only=True))
-        raw = _infer_hdf5(m, isic_ids, hdf5_path, EDG_IMG_SIZE, device, batch_size, num_workers)
-        m.to("cpu"); del m; gc.collect(); torch.cuda.empty_cache()
-        edg_scaled.append((raw - scaling["edg_mean"]) / scaling["edg_std"])
-    df["predictions_edg"] = np.mean(edg_scaled, axis=0)
-    df = add_patient_norm(df, "predictions_edg", "predictions_edg_m")
+        out[f"edg_{fold}"] = _run_cnn(ISICModelEdgnet(EDG_MODEL_NAME, pretrained=False, num_classes=1), f"edg_model__{fold}",
+                                      ids, hdf5_path, EDG_IMG_SIZE, device, batch_size, num_workers)
+    return pd.DataFrame(out)
 
+
+def load_or_compute_cnn_outputs(ids, cache_path, hdf5_path, device, batch_size, num_workers, refresh=False):
+    """Raw CNN outputs for `ids` (in that order): from the parquet cache where present, computed
+    (and appended to the cache) for any ids that are missing."""
+    cache_path = Path(cache_path)
+    cache = pd.read_parquet(cache_path) if cache_path.exists() and not refresh else None
+    have = set(cache[ID_COL]) if cache is not None else set()
+    missing = [i for i in ids if i not in have]
+    if missing:
+        print(f"  [cnn cache] computing {len(missing)} of {len(ids)} lesions ...")
+        new = compute_raw_cnn_outputs(missing, hdf5_path, device, batch_size, num_workers)
+        cache = new if cache is None else pd.concat([cache, new], ignore_index=True)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache.to_parquet(cache_path, index=False)
+        print(f"  [cnn cache] saved {len(cache)} lesions to {cache_path}")
+    else:
+        print(f"  [cnn cache] loaded all {len(ids)} lesions from {cache_path}")
+    return cache.drop_duplicates(ID_COL).set_index(ID_COL).loc[ids].reset_index()
+
+
+def image_features_from_cnn(df, cnn, scaling):
+    """Same features as compute_image_features_hdf5, built from raw CNN outputs: old_set_0..2 (+ _m),
+    predictions_eva (+ _m), predictions_edg (+ _m). `df` has isic_id and patient_id."""
+    cnn = cnn.set_index(ID_COL).loc[df[ID_COL]]
+    for k in range(3):
+        df[f"old_set_{k}"] = cnn[f"old_{k}"].values
+        df = add_patient_norm(df, f"old_set_{k}", f"old_set_{k}_m")
+    for name, key in (("eva", "predictions_eva"), ("edg", "predictions_edg")):
+        scaled = [(cnn[f"{name}_{f}"].values - scaling[f"{name}_mean"]) / scaling[f"{name}_std"] for f in range(5)]
+        df[key] = np.mean(scaled, axis=0)
+        df = add_patient_norm(df, key, f"{key}_m")
     return df
 
 
@@ -241,7 +257,9 @@ def predict_hdf5(
         lof_by_site=False,
         lof_null=0.0,
         features_dict=None,
-        ensemble="rank"
+        ensemble="rank",
+        cnn_cache=None,
+        refresh_cnn_cache=False
         ):
     feature_cols = artifacts["feature_cols"]
     columns_to_drop = artifacts["columns_to_drop"]
@@ -288,7 +306,10 @@ def predict_hdf5(
     # --- image features (neural nets, read from HDF5) --------------------------
     print("Running image models ...")
     img = raw[[ID_COL, GROUP_COL]].copy()
-    img = compute_image_features_hdf5(img, hdf5_path, device, artifacts["scaling"], batch_size, num_workers)
+    cnn_cache = cnn_cache or Path(input_csv).with_name(f"{Path(input_csv).stem}_cnn_outputs.parquet")
+    cnn = load_or_compute_cnn_outputs(raw[ID_COL].tolist(), cnn_cache, hdf5_path, device, batch_size,
+                                      num_workers, refresh_cnn_cache)
+    img = image_features_from_cnn(img, cnn, artifacts["scaling"])
     image_cols = [c for c in img.columns if c not in (ID_COL, GROUP_COL)]
     df = df.merge(img[[ID_COL] + image_cols], how="left", on=ID_COL)
 
@@ -338,6 +359,10 @@ def main():
     ap.add_argument("--ensemble", choices=["rank", "calibrated"], default="rank",
                     help="How to combine GBDT models: percentile-rank average (default) or average of "
                          "per-model Platt-calibrated probabilities.")
+    ap.add_argument("--cnn-cache", type=Path, default=None,
+                    help="Parquet cache of raw CNN outputs, computed if missing and loaded if present "
+                         "(default: <input>_cnn_outputs.parquet).")
+    ap.add_argument("--refresh-cnn-cache", action="store_true", help="Recompute CNN outputs even if cached.")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -378,7 +403,9 @@ def main():
         lof_by_site=args.lof_by_site,
         lof_null=args.lof_null,
         features_dict=top_features_dict,
-        ensemble=args.ensemble
+        ensemble=args.ensemble,
+        cnn_cache=args.cnn_cache,
+        refresh_cnn_cache=args.refresh_cnn_cache
         )
     print("All done!")
 

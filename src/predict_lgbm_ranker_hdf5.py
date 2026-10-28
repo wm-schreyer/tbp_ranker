@@ -29,7 +29,6 @@ Usage
         --model_prefix gain100_ --output ranker_preds.csv
 """
 import argparse
-import gc
 import json
 from pathlib import Path
 
@@ -40,12 +39,10 @@ import pandas as pd
 import torch
 
 from retrain_predict import (
-    ISICModel, ISICModelEdgnet, add_patient_norm, read_data, get_lof_score_pat_norm,
-    get_lof_bysite_pat_norm, fill_inf, custom_metric_raw,
-    MODELS_DIR, EVA_MODEL_NAME, EVA_IMG_SIZE, EDG_MODEL_NAME, EDG_IMG_SIZE,
+    read_data, get_lof_score_pat_norm, get_lof_bysite_pat_norm, fill_inf, custom_metric_raw,
     cat_cols_base, ID_COL, TARGET_COL, GROUP_COL, ARTIFACT_DIR, TOP_FEATURES_PATH,
 )
-from retrain_predict_hdf5 import _infer_hdf5
+from retrain_predict_hdf5 import load_or_compute_cnn_outputs, image_features_from_cnn
 from train_lgbm_ranker import METHODS, aggregate_scores, build_relevance_labels, topk_recall
 
 
@@ -56,68 +53,6 @@ def load_ranker_artifacts(artifact_dir, prefix):
     meta = joblib.load(artifact_dir / f"{prefix}ranker_meta.joblib")
     print(f"Loaded {len(models)} rankers from {artifact_dir}")
     return models, calibrators, meta
-
-
-def _run_cnn(model, ckpt, ids, hdf5_path, img_size, device, batch_size, num_workers):
-    """Load one checkpoint, run it over `ids`, free it. (_infer_hdf5 squeezes, so 1 id is padded.)"""
-    model = model.to(device)
-    model.load_state_dict(torch.load(MODELS_DIR / ckpt, weights_only=True))
-    padded = ids if len(ids) > 1 else ids * 2
-    out = _infer_hdf5(model, padded, hdf5_path, img_size, device, batch_size, num_workers)[:len(ids)]
-    model.to("cpu"); del model; gc.collect(); torch.cuda.empty_cache()
-    return out
-
-
-def compute_raw_cnn_outputs(ids, hdf5_path, device, batch_size, num_workers):
-    """Raw (unscaled) outputs of the CNNs: old_0..2, eva_0..4, edg_0..4, one row per isic_id."""
-    out = {ID_COL: list(ids)}
-    print("  [image] EVA02 3-class 'old set' model ...")
-    preds3 = _run_cnn(ISICModel(EVA_MODEL_NAME, pretrained=False, num_classes=3), "ema_small_pretrained",
-                      ids, hdf5_path, EVA_IMG_SIZE, device, batch_size, num_workers)
-    for k in range(3):
-        out[f"old_{k}"] = preds3[:, k]
-    print("  [image] EVA02 5 folds ...")
-    for fold in range(5):
-        out[f"eva_{fold}"] = _run_cnn(ISICModel(EVA_MODEL_NAME, pretrained=False, num_classes=1), f"eva_model__{fold}",
-                                      ids, hdf5_path, EVA_IMG_SIZE, device, batch_size, num_workers)
-    print("  [image] EdgeNeXt 5 folds ...")
-    for fold in range(5):
-        out[f"edg_{fold}"] = _run_cnn(ISICModelEdgnet(EDG_MODEL_NAME, pretrained=False, num_classes=1), f"edg_model__{fold}",
-                                      ids, hdf5_path, EDG_IMG_SIZE, device, batch_size, num_workers)
-    return pd.DataFrame(out)
-
-
-def load_or_compute_cnn_outputs(ids, cache_path, hdf5_path, device, batch_size, num_workers, refresh=False):
-    """Raw CNN outputs for `ids` (in that order): from the parquet cache where present, computed
-    (and appended to the cache) for any ids that are missing."""
-    cache_path = Path(cache_path)
-    cache = pd.read_parquet(cache_path) if cache_path.exists() and not refresh else None
-    have = set(cache[ID_COL]) if cache is not None else set()
-    missing = [i for i in ids if i not in have]
-    if missing:
-        print(f"  [cnn cache] computing {len(missing)} of {len(ids)} lesions ...")
-        new = compute_raw_cnn_outputs(missing, hdf5_path, device, batch_size, num_workers)
-        cache = new if cache is None else pd.concat([cache, new], ignore_index=True)
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache.to_parquet(cache_path, index=False)
-        print(f"  [cnn cache] saved {len(cache)} lesions to {cache_path}")
-    else:
-        print(f"  [cnn cache] loaded all {len(ids)} lesions from {cache_path}")
-    return cache.drop_duplicates(ID_COL).set_index(ID_COL).loc[ids].reset_index()
-
-
-def image_features_from_cnn(df, cnn, scaling):
-    """Same features as compute_image_features_hdf5, built from raw CNN outputs: old_set_0..2 (+ _m),
-    predictions_eva (+ _m), predictions_edg (+ _m). `df` has isic_id and patient_id."""
-    cnn = cnn.set_index(ID_COL).loc[df[ID_COL]]
-    for k in range(3):
-        df[f"old_set_{k}"] = cnn[f"old_{k}"].values
-        df = add_patient_norm(df, f"old_set_{k}", f"old_set_{k}_m")
-    for name, key in (("eva", "predictions_eva"), ("edg", "predictions_edg")):
-        scaled = [(cnn[f"{name}_{f}"].values - scaling[f"{name}_mean"]) / scaling[f"{name}_std"] for f in range(5)]
-        df[key] = np.mean(scaled, axis=0)
-        df = add_patient_norm(df, key, f"{key}_m")
-    return df
 
 
 def build_feature_matrix(input_csv, hdf5_path, meta, device, batch_size, num_workers, lof_by_site, lof_null,
