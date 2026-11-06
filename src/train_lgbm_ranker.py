@@ -216,7 +216,7 @@ def main():
     ap.add_argument("--neg-per-group", type=int, default=0,
                     help="If > 0, keep at most this many label-0 rows per query (overrides --neg-frac).")
     ap.add_argument("--objective", choices=["lambdarank", "rank_xendcg"], default="lambdarank",
-                    help="rank_xendcg is cheaper and has no truncation level; as I recall LightGBM then "
+                    help="rank_xendcg is cheaper and has no truncation level; LightGBM then "
                          "ignores --label-gain for training (it still uses it for the NDCG metric).")
     ap.add_argument("--truncation-level", type=int, default=30,
                     help="lambdarank_truncation_level: pairs are formed only if one item is in the model's "
