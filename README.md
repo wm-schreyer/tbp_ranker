@@ -5,6 +5,9 @@
 * [Results](#results)
 * [Using this Repository](#using-this-repository)
 
+## Disclaimer
+This software is for research purposes only and should not be used to treat patients. It is not a medical device and has not been approved by any regulatory body. Anyone who modifies, uses or distributes this software does so entirely at their own risk and takes on all responsibility for compliance with applicable laws and regulations.
+
 ## Background
 The [ISIC 2024 Challenge](https://www.kaggle.com/competitions/isic-2024-challenge/overview) was an AI/ML competition hosted on Kaggle with the objective of predicting skin cancer. The data was sourced from 9 medical centers across Europe, Australia and North America and images were captured using Vectra WB360 total body photography (TBP) systems. 
 
