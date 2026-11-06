@@ -1,6 +1,4 @@
 {
-  "ROOT": "/path/to/kaggle/",
-  "PROJECT": "/path/to/project/",
   "TRAIN_META_PATH": "/path/to/train-metadata.csv",
   "MODELS_DIR": "/path/to/project/skin-models-base",
   "ARTIFACT_DIR": "/path/to/project/skin-models-base/predict_artifacts",

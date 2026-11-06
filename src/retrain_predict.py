@@ -92,10 +92,6 @@ from imblearn.pipeline import Pipeline
 with open(Path(__file__).resolve().parent.parent / "paths.json") as _f:
     _PATHS = json.load(_f)
 
-# Root of the original Kaggle data (used only when training the GBDT stack).
-ROOT = Path(_PATHS["ROOT"])
-PROJECT = Path(_PATHS["PROJECT"])
-
 TRAIN_META_PATH = Path(_PATHS["TRAIN_META_PATH"])
 
 # Directory holding the neural-net weights + OOF parquets shipped with the model.
